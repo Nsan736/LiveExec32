@@ -12,7 +12,7 @@ LC32_DEBUG_LOGS ?= 0
 # Times each outermost guest callback against the 60 Hz vsync budget. Kept
 # separate from the traces above because those would dominate the interval it
 # measures.
-LC32_TRACE_GUEST_FRAME_TIME ?= 0
+LC32_TRACE_GUEST_FRAME_TIME ?= 1
 # The root app signs the embedded copy after its optional Catalyst rewrite.
 TARGET_CODESIGN =
 
