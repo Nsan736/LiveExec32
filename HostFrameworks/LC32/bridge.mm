@@ -5,8 +5,11 @@
 
 #import <dispatch/dispatch.h>
 #import <mach/mach_init.h>
+#import <mach/mach_time.h>
 #import <mach/vm_map.h>
 #import <objc/message.h>
+
+#include <cmath>
 
 #include <atomic>
 #include <array>
@@ -4755,11 +4758,127 @@ static double LC32InvokeGuestSelectorCGRectGuestDoubleHostDouble(
 
 // Keep x2-x7 as explicit parameters, then consume any arguments which the
 // arm64 caller placed on the stack through va_list.
+/*
+ * Guest frame timing.
+ *
+ * A CADisplayLink target runs to completion inside one outermost
+ * LC32InvokeGuestSelectorRaw call, so that call's wall time is the frame time
+ * the host display link is waiting on. Once it exceeds one vsync period the
+ * link skips periods rather than queueing them, which quantizes the guest's
+ * frame rate to 60/30/20/15 Hz and doubles or triples the dt a guest physics
+ * integrator steps with.
+ *
+ * Build with -DLC32_TRACE_GUEST_FRAME_TIME=1 to measure it. This is
+ * deliberately not tied to LC32_DEBUG_LOGS: those logs are verbose enough to
+ * dominate the interval being measured.
+ */
+#ifndef LC32_TRACE_GUEST_FRAME_TIME
+#define LC32_TRACE_GUEST_FRAME_TIME 0
+#endif
+
+#if LC32_TRACE_GUEST_FRAME_TIME
+namespace {
+
+constexpr double kGuestFrameBudgetMilliseconds = 1000.0 / 60.0;
+constexpr unsigned kGuestFrameSummaryInterval = 60;
+
+double GuestFrameMilliseconds(u64 elapsedTicks) {
+    static const mach_timebase_info_data_t timebase = [] {
+        mach_timebase_info_data_t info = {};
+        if(mach_timebase_info(&info) != KERN_SUCCESS || !info.denom) {
+            info.numer = 1;
+            info.denom = 1;
+        }
+        return info;
+    }();
+    return static_cast<double>(elapsedTicks) * timebase.numer /
+        (static_cast<double>(timebase.denom) * 1e6);
+}
+
+struct GuestFrameTraceState {
+    unsigned depth;
+    u64 start;
+    unsigned samples;
+    unsigned overBudget;
+    double total;
+    double worst;
+};
+
+thread_local GuestFrameTraceState guestFrameTrace = {};
+
+/*
+ * Nested callbacks (a guest selector reached through a host call made by the
+ * guest) must not be timed separately: they are part of the outer frame, and
+ * the depth counter keeps them out of the statistics. Blocks and C callbacks
+ * do not pass through here at all, so they stay inside the outer interval
+ * where they belong.
+ */
+struct GuestFrameTraceScope {
+    char kind;
+    const char *className;
+    const char *selectorName;
+
+    GuestFrameTraceScope(id receiver, SEL selector) {
+        // Copy the names now: the receiver may not outlive the call.
+        kind = object_isClass(receiver) ? '+' : '-';
+        className = receiver
+            ? class_getName(object_getClass(receiver)) : "(null)";
+        selectorName = selector ? sel_getName(selector) : "(null)";
+        if(guestFrameTrace.depth++ == 0) {
+            guestFrameTrace.start = mach_absolute_time();
+        }
+    }
+
+    ~GuestFrameTraceScope() {
+        if(--guestFrameTrace.depth != 0) return;
+
+        const double milliseconds = GuestFrameMilliseconds(
+            mach_absolute_time() - guestFrameTrace.start);
+        GuestFrameTraceState &state = guestFrameTrace;
+        state.samples++;
+        state.total += milliseconds;
+        if(milliseconds > state.worst) state.worst = milliseconds;
+
+        if(milliseconds > kGuestFrameBudgetMilliseconds) {
+            state.overBudget++;
+            fprintf(stderr,
+                "LC32 frame: %c[%s %s] %.2f ms, %.2f ms over the %.2f ms "
+                "budget, %d vsync periods at 60 Hz\n",
+                kind, className, selectorName, milliseconds,
+                milliseconds - kGuestFrameBudgetMilliseconds,
+                kGuestFrameBudgetMilliseconds,
+                static_cast<int>(
+                    std::ceil(milliseconds / kGuestFrameBudgetMilliseconds)));
+        }
+
+        if(state.samples >= kGuestFrameSummaryInterval) {
+            fprintf(stderr,
+                "LC32 frame summary: %u callbacks, mean %.2f ms, worst "
+                "%.2f ms, %u over budget\n",
+                state.samples, state.total / state.samples, state.worst,
+                state.overBudget);
+            state.samples = 0;
+            state.overBudget = 0;
+            state.total = 0;
+            state.worst = 0;
+        }
+    }
+};
+
+}  // namespace
+
+#define LC32_TRACE_GUEST_FRAME(receiver, selector) \
+    GuestFrameTraceScope lc32GuestFrameTraceScope((receiver), (selector))
+#else
+#define LC32_TRACE_GUEST_FRAME(receiver, selector) do {} while(0)
+#endif
+
 static u64 LC32InvokeGuestSelectorRaw(id self, SEL _cmd,
                                      u64 arg2, u64 arg3, u64 arg4,
                                      u64 arg5, u64 arg6, u64 arg7,
                                      va_list *hostStackArguments,
                                      Method *resolvedMethod) {
+    LC32_TRACE_GUEST_FRAME(self, _cmd);
     LC32TraceGuestMethodCallback(self, _cmd);
     Method method = object_isClass(self) ? class_getClassMethod(self, _cmd) : class_getInstanceMethod((Class)[self class], _cmd);
     if(resolvedMethod) *resolvedMethod = method;

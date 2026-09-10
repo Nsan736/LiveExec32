@@ -9,6 +9,10 @@ OPTFLAG = -O2
 # Verbose bridge, loader, memory, and syscall traces are opt-in, independent
 # of optimization or debug symbols. Errors remain enabled in every build.
 LC32_DEBUG_LOGS ?= 0
+# Times each outermost guest callback against the 60 Hz vsync budget. Kept
+# separate from the traces above because those would dominate the interval it
+# measures.
+LC32_TRACE_GUEST_FRAME_TIME ?= 0
 # The root app signs the embedded copy after its optional Catalyst rewrite.
 TARGET_CODESIGN =
 
@@ -68,7 +72,8 @@ LiveExec32Shared_FILES = \
 	../OpenAL/OpenAL.mm ../OpenGLES/OpenGLES.mm ../UIKit/UIKit.mm
 LiveExec32Shared_CFLAGS = \
 	-I. -I$(DYNARMIC_ROOT)/src -I../../include -DDYNARMIC_MASTER \
-	-I../../External/mini-gdbstub/include -DLC32_DEBUG_LOGS=$(LC32_DEBUG_LOGS)
+	-I../../External/mini-gdbstub/include -DLC32_DEBUG_LOGS=$(LC32_DEBUG_LOGS) \
+	-DLC32_TRACE_GUEST_FRAME_TIME=$(LC32_TRACE_GUEST_FRAME_TIME)
 LiveExec32Shared_CCFLAGS = -std=c++17
 crash_exception.mm_CFLAGS = -fobjc-arc
 LiveExec32Shared_OBJ_FILES = $(DYNARMIC_STATIC_LIBS)
