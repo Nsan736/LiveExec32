@@ -15,6 +15,7 @@
 #include <array>
 #include <cerrno>
 #include <cstddef>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -4781,6 +4782,9 @@ namespace {
 
 constexpr double kGuestFrameBudgetMilliseconds = 1000.0 / 60.0;
 constexpr unsigned kGuestFrameSummaryInterval = 60;
+// About four seconds of callbacks at 30 Hz: long enough that the handoff is
+// rare, short enough that a crash loses little.
+constexpr size_t kGuestFrameFlushInterval = 128;
 
 double GuestFrameMilliseconds(u64 elapsedTicks) {
     static const mach_timebase_info_data_t timebase = [] {
@@ -4795,16 +4799,121 @@ double GuestFrameMilliseconds(u64 elapsedTicks) {
         (static_cast<double>(timebase.denom) * 1e6);
 }
 
+struct GuestFrameSample {
+    double milliseconds;
+    // class_getName and sel_getName return strings owned by the runtime, so
+    // they stay valid after the receiver is gone and on the writer thread.
+    const char *className;
+    const char *selectorName;
+    char kind;
+};
+
+/*
+ * The trace lands next to LiveExec32.log in the container's Documents
+ * directory, which is what log.m already writes to and what LiveContainer
+ * exposes for the guest app. The previous run is kept as .old.log; within a
+ * run the file is appended to.
+ */
+FILE *GuestFrameTraceFile() {
+    static FILE *const file = [] () -> FILE * {
+        NSString *documents = [NSFileManager.defaultManager
+            URLsForDirectory:NSDocumentDirectory
+                   inDomains:NSUserDomainMask].lastObject.path;
+        if(!documents) return nullptr;
+
+        NSString *current = [documents
+            stringByAppendingPathComponent:@"LiveExec32-frames.log"];
+        NSString *previous = [documents
+            stringByAppendingPathComponent:@"LiveExec32-frames.old.log"];
+        NSFileManager *manager = NSFileManager.defaultManager;
+        [manager removeItemAtPath:previous error:nil];
+        [manager moveItemAtPath:current toPath:previous error:nil];
+
+        FILE *handle = fopen(current.fileSystemRepresentation, "a");
+        if(!handle) {
+            fprintf(stderr, "LC32: cannot open the guest frame trace at %s\n",
+                current.fileSystemRepresentation);
+            return nullptr;
+        }
+        // Buffer generously and never fsync: the point is to keep the write
+        // cost away from the interval being measured.
+        static char buffer[64 * 1024];
+        setvbuf(handle, buffer, _IOFBF, sizeof(buffer));
+        fprintf(handle,
+            "# LiveExec32 guest frame trace\n"
+            "# milliseconds\tvsync periods at 60 Hz\tcallback\n");
+        // A crash still loses at most one unflushed batch; this only covers
+        // an orderly exit.
+        atexit([] {
+            if(FILE *open = GuestFrameTraceFile()) fflush(open);
+        });
+        return handle;
+    }();
+    return file;
+}
+
+dispatch_queue_t GuestFrameTraceQueue() {
+    static dispatch_queue_t const queue = dispatch_queue_create(
+        "com.kdt.liveexec32.frame-trace", DISPATCH_QUEUE_SERIAL);
+    return queue;
+}
+
+// Formatting and I/O run here, off the guest thread.
+void WriteGuestFrameSamples(const std::vector<GuestFrameSample> &samples) {
+    FILE *file = GuestFrameTraceFile();
+    if(!file) return;
+
+    static unsigned summaryCount = 0;
+    static unsigned summaryOverBudget = 0;
+    static double summaryTotal = 0;
+    static double summaryWorst = 0;
+
+    for(const GuestFrameSample &sample : samples) {
+        fprintf(file, "%.2f\t%d\t%c[%s %s]\n", sample.milliseconds,
+            static_cast<int>(std::ceil(
+                sample.milliseconds / kGuestFrameBudgetMilliseconds)),
+            sample.kind, sample.className, sample.selectorName);
+
+        summaryCount++;
+        summaryTotal += sample.milliseconds;
+        if(sample.milliseconds > summaryWorst)
+            summaryWorst = sample.milliseconds;
+        if(sample.milliseconds > kGuestFrameBudgetMilliseconds)
+            summaryOverBudget++;
+
+        if(summaryCount >= kGuestFrameSummaryInterval) {
+            fprintf(file,
+                "# summary: %u callbacks, mean %.2f ms, worst %.2f ms, "
+                "%u over the %.2f ms budget\n",
+                summaryCount, summaryTotal / summaryCount, summaryWorst,
+                summaryOverBudget, kGuestFrameBudgetMilliseconds);
+            summaryCount = 0;
+            summaryOverBudget = 0;
+            summaryTotal = 0;
+            summaryWorst = 0;
+        }
+    }
+    fflush(file);
+}
+
 struct GuestFrameTraceState {
     unsigned depth;
     u64 start;
-    unsigned samples;
-    unsigned overBudget;
-    double total;
-    double worst;
+    std::vector<GuestFrameSample> samples;
 };
 
 thread_local GuestFrameTraceState guestFrameTrace = {};
+
+void FlushGuestFrameSamples(GuestFrameTraceState &state) {
+    if(state.samples.empty()) return;
+    auto batch = std::make_shared<std::vector<GuestFrameSample>>(
+        std::move(state.samples));
+    state.samples.clear();
+    state.samples.reserve(kGuestFrameFlushInterval);
+    dispatch_async(GuestFrameTraceQueue(), ^{
+        WriteGuestFrameSamples(*batch);
+    });
+}
 
 /*
  * Nested callbacks (a guest selector reached through a host call made by the
@@ -4829,38 +4938,21 @@ struct GuestFrameTraceScope {
         }
     }
 
+    /*
+     * Only the timestamp and one push_back happen on the guest thread. The
+     * batch is handed to a background queue that does the formatting and the
+     * write, so a frame never pays for I/O and never blocks on the file.
+     */
     ~GuestFrameTraceScope() {
         if(--guestFrameTrace.depth != 0) return;
 
         const double milliseconds = GuestFrameMilliseconds(
             mach_absolute_time() - guestFrameTrace.start);
         GuestFrameTraceState &state = guestFrameTrace;
-        state.samples++;
-        state.total += milliseconds;
-        if(milliseconds > state.worst) state.worst = milliseconds;
-
-        if(milliseconds > kGuestFrameBudgetMilliseconds) {
-            state.overBudget++;
-            fprintf(stderr,
-                "LC32 frame: %c[%s %s] %.2f ms, %.2f ms over the %.2f ms "
-                "budget, %d vsync periods at 60 Hz\n",
-                kind, className, selectorName, milliseconds,
-                milliseconds - kGuestFrameBudgetMilliseconds,
-                kGuestFrameBudgetMilliseconds,
-                static_cast<int>(
-                    std::ceil(milliseconds / kGuestFrameBudgetMilliseconds)));
-        }
-
-        if(state.samples >= kGuestFrameSummaryInterval) {
-            fprintf(stderr,
-                "LC32 frame summary: %u callbacks, mean %.2f ms, worst "
-                "%.2f ms, %u over budget\n",
-                state.samples, state.total / state.samples, state.worst,
-                state.overBudget);
-            state.samples = 0;
-            state.overBudget = 0;
-            state.total = 0;
-            state.worst = 0;
+        state.samples.push_back(
+            {milliseconds, className, selectorName, kind});
+        if(state.samples.size() >= kGuestFrameFlushInterval) {
+            FlushGuestFrameSamples(state);
         }
     }
 };
