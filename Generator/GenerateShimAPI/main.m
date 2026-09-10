@@ -229,6 +229,32 @@ static LC32KnownStruct LC32KnownStructForEncoding(const char *encoding) {
     return YES;
 }
 
+/*
+ * A pointer to a single object cell: `id *` or `Class *`, as used by every
+ * NSError ** out parameter.  Runtime encodings spell it either bare (`^@`)
+ * or qualified (`o^@`), and the pointer cases below switch on the raw first
+ * byte, so only the bare spelling ever reached them.  The qualified spelling
+ * fell through to "unhandled type", which disables the whole method.
+ *
+ * Only the bare and `o` spellings qualify.  A const input pointer (`r^@` /
+ * `n^@`) stays excluded because an encoding cannot tell a one-object
+ * parameter from a caller-provided object array, which is what
+ * LC32MethodHasIndirectObjectBuffer covers; `N^@` (inout) is excluded
+ * because the cell below is deliberately zeroed rather than seeded with the
+ * guest's incoming object.
+ */
+- (const char *)objectOutPointerSignature {
+    for(const char *cursor = self.signature;
+        cursor && *cursor && strchr("rnNoORVA", *cursor); cursor++) {
+        if(*cursor != 'o') return NULL;
+    }
+    const char *pointer = [MethodParameter unqualifiedType:self.signature];
+    if(!pointer || pointer[0] != '^') return NULL;
+    const char *pointee = [MethodParameter unqualifiedType:pointer + 1];
+    if(!pointee || (pointee[0] != '@' && pointee[0] != '#')) return NULL;
+    return pointer;
+}
+
 - (instancetype)initWithIndex:(int)index name:(NSString *)name type:(NSString *)type signature:(const char *)signature {
     self = [super init];
     self.index = index;
@@ -281,6 +307,12 @@ static LC32KnownStruct LC32KnownStructForEncoding(const char *encoding) {
         return [NSString stringWithFormat:
             @"%2$@ host_arg%1$d = %3$@;",
             self.index, hostType, zero];
+    }
+    /* The cell starts empty whether or not the encoding carried a qualifier:
+     * the callee owns what lands in it. */
+    if(self.objectOutPointerSignature) {
+        return [NSString stringWithFormat:
+            @"uint64_t host_arg%d = 0;", self.index];
     }
     if([MethodParameter isDirectCastType:self.signature[0]]) {
         return [NSString stringWithFormat:@"uint64_t host_arg%1$d = (uint64_t)guest_arg%1$d;", self.index];
@@ -353,6 +385,11 @@ static LC32KnownStruct LC32KnownStructForEncoding(const char *encoding) {
             @"%2$@(guest_arg%1$d ? &host_arg%1$d : NULL)",
             self.index, helper];
     }
+    if(self.objectOutPointerSignature) {
+        return [NSString stringWithFormat:
+            @"LC32HostIndirectArgument(guest_arg%1$d ? &host_arg%1$d : NULL)",
+            self.index];
+    }
     BOOL returnDirect = NO;
     BOOL returnPointer = NO;
     switch(self.signature[0]) {
@@ -415,6 +452,11 @@ static LC32KnownStruct LC32KnownStructForEncoding(const char *encoding) {
                 @"if(guest_arg%1$d) *guest_arg%1$d = (%2$@)host_arg%1$d;",
                 self.index, pointeeType];
         }
+    }
+    if(self.objectOutPointerSignature) {
+        return [NSString stringWithFormat:
+            @"if(guest_arg%1$d) *guest_arg%1$d = host_arg%1$d ? LC32HostToGuestObject(host_arg%1$d) : nil;",
+            self.index];
     }
     switch(self.signature[0]) {
         case 'r':
@@ -503,6 +545,10 @@ static BOOL LC32MethodReturnsOwnedResult(NSString *className,
 @property(nonatomic, retain) NSMutableArray<MethodParameter *> *parameters;
 @property(nonatomic, retain) NSMutableArray<NSString *> *lines;
 @property(nonatomic) BOOL skip;
+// Set when the body was wrapped in #if 0 because a type had no bridge. The
+// class still compiles, so only -Wincomplete-implementation reports it and
+// the selector goes missing at run time; the summary counts these.
+@property(nonatomic) BOOL disabled;
 @end
 @implementation MethodBuilder
 
@@ -595,6 +641,7 @@ static BOOL LC32MethodReturnsOwnedResult(NSString *className,
     if([self.description containsString:@"unhandled type"]) {
         [self.lines insertObject:@"#if 0 // FIXME: has unhandled types" atIndex:0];
         [self.lines addObject:@"#endif"];
+        self.disabled = YES;
     }
     return self;
 }
@@ -739,6 +786,7 @@ static BOOL LC32MethodReturnsOwnedResult(NSString *className,
 @property(nonatomic) BOOL usesRuntimeSignatures;
 @property(nonatomic) NSUInteger skippedIncompleteMethods;
 @property(nonatomic) NSUInteger skippedFilteredMethods;
+@property(nonatomic, readonly) NSUInteger disabledMethods;
 - (void)validateAndAddMethod:(LC32ObjCMethod *)method;
 - (void)validateAndAddRuntimeMethod:(Method)objcMethod
                   isInstanceMethod:(BOOL)isInstanceMethod;
@@ -1142,6 +1190,17 @@ static BOOL LC32MethodHasIndirectObjectBuffer(NSString *className,
         initWithMethod:method className:self.className];
 }
 
+- (NSUInteger)disabledMethods {
+    NSUInteger count = 0;
+    for(id builder in self.methods.allValues) {
+        if([builder isKindOfClass:MethodBuilder.class] &&
+           ((MethodBuilder *)builder).disabled) {
+            count++;
+        }
+    }
+    return count;
+}
+
 - (NSString *)description {
     NSMutableString *string = [NSMutableString new];
     [string appendString:@"// Generated file\n"];
@@ -1438,6 +1497,7 @@ typedef struct {
     NSUInteger generated;
     NSUInteger unavailable;
     NSUInteger failures;
+    NSUInteger disabledMethods;
 } LC32RuntimeGenerationResult;
 
 static LC32RuntimeGenerationResult
@@ -1539,6 +1599,7 @@ LC32GenerateRuntimeUIKitExtras(NSString *outputRoot,
             continue;
         }
         result.generated++;
+        result.disabledMethods += classBuilder.disabledMethods;
     }
     return result;
 }
@@ -1624,6 +1685,7 @@ int main(int argc, char **argv) {
         NSUInteger methodCount = 0;
         NSUInteger skippedIncompleteMethods = 0;
         NSUInteger skippedFilteredMethods = 0;
+        NSUInteger disabledMethods = 0;
         NSUInteger writeFailureCount = 0;
         NSMutableSet<NSString *> *createdFrameworks = [NSMutableSet new];
 
@@ -1691,6 +1753,7 @@ int main(int argc, char **argv) {
                         classBuilder.skippedIncompleteMethods;
                     skippedFilteredMethods +=
                         classBuilder.skippedFilteredMethods;
+                    disabledMethods += classBuilder.disabledMethods;
 
                     error = nil;
                     if(!LC32WriteClass(classBuilder, outputPath, &error)) {
@@ -1726,6 +1789,16 @@ int main(int argc, char **argv) {
                    (unsigned long)runtimeResult.unavailable);
         }
         printf(".\n");
+
+        /* A disabled method compiles away to nothing: the class keeps its
+         * @implementation, Clang reports only -Wincomplete-implementation,
+         * and the guest hits an unrecognized selector when it is finally
+         * sent.  Report the total so a regression is visible at generation
+         * time rather than in a crash log. */
+        printf("Disabled %lu methods with unhandled types "
+               "(wrapped in #if 0).\n",
+               (unsigned long)(disabledMethods +
+                   runtimeResult.disabledMethods));
 
         return writeFailureCount == 0 && runtimeResult.failures == 0 &&
                runtimeResult.unavailable == 0 ? 0 : 1;

@@ -398,6 +398,7 @@ SHORT_TESTS := $(patsubst lc32-%,%,$(TOOL_NAME))
   abi audio corefoundation graphics threading uikit \
   check-symbols check-openal check-opengles check-security check-coretext \
   check-graphics-symbols check-public-constants \
+  check-generated-disabled-methods \
   check-generated-framework-symbols check-generated-gameplay-symbols \
   check-generated-ui-framework-symbols \
   check-generated-public-symbols check-generated-legacy-public-symbols \
@@ -466,6 +467,8 @@ check-graphics-symbols: lc32-coregraphics-bitmap lc32-quartzcore-transform \
 check-public-constants: lc32-mobilecoreservices-uti lc32-cfnetwork-http
 	GUEST_FRAMEWORK_DIR="$(GUEST_FRAMEWORK_DIR)" SDKROOT="$(ISYSROOT)" \
 		./public_guest_constants.sh
+check-generated-disabled-methods:
+	./generated_disabled_methods.sh
 check-generated-framework-symbols: frameworks
 	GUEST_FRAMEWORK_DIR="$(GUEST_FRAMEWORK_DIR)" SDKROOT="$(ISYSROOT)" \
 		./generated_framework_symbols.sh

@@ -1,0 +1,5 @@
+# Highest allowed number of generated methods disabled with `#if 0`.
+# Lower it whenever a build reports fewer; generated_disabled_methods.sh
+# prints the new value. Never raise it without knowing which encodings lost
+# their bridge.
+446
