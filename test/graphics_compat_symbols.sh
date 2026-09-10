@@ -28,15 +28,20 @@ audit_image() {
 }
 
 audit_image "$FRAMEWORK_DIR/CoreGraphics.framework/CoreGraphics" \
+    CGColorRetain \
+    CGColorSpaceRetain \
     CGContextAddLines \
+    CGContextRetain \
     CGContextSetGrayStrokeColor \
     CGContextSetLineJoin \
     CGContextSetShadow \
     CGContextSetTextMatrix \
     CGDataProviderCreateWithCFData \
+    CGGradientRetain \
     CGImageCreateCopy \
     CGImageCreate \
     CGImageGetDataProvider \
+    CGImageRetain \
     CGPathGetBoundingBox
 
 audit_image "$FRAMEWORK_DIR/QuartzCore.framework/QuartzCore" \

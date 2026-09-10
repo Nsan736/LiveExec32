@@ -73,6 +73,10 @@ bool CGColorEqualToColor(CGColorRef color1, CGColorRef color2) {
         LC32_CG_HOST(color1), LC32_CG_HOST(color2)) != 0;
 }
 
+CGColorRef CGColorRetain(CGColorRef color) {
+    return color ? (CGColorRef)CFRetain(color) : NULL;
+}
+
 void CGColorRelease(CGColorRef color) {
     if(color) CFRelease(color);
 }
@@ -125,6 +129,11 @@ CGColorSpaceModel CGColorSpaceGetModel(CGColorSpaceRef space) {
         LC32CoreGraphicsOpColorSpaceGetModel,
         LC32_CG_HOST(space)) : kCGColorSpaceModelUnknown;
 }
+
+CGColorSpaceRef CGColorSpaceRetain(CGColorSpaceRef space) {
+    return space ? (CGColorSpaceRef)CFRetain(space) : NULL;
+}
+
 void CGColorSpaceRelease(CGColorSpaceRef color) {
     if(!color) return;
     CFRelease(color);
@@ -150,6 +159,10 @@ CGGradientRef CGGradientCreateWithColors(
         LC32CoreGraphicsOpGradientCreateWithColors,
         LC32_CG_HOST(space), LC32_CG_HOST(colors),
         LC32_CG_U32((uintptr_t)locations));
+}
+
+CGGradientRef CGGradientRetain(CGGradientRef gradient) {
+    return gradient ? (CGGradientRef)CFRetain(gradient) : NULL;
 }
 
 void CGGradientRelease(CGGradientRef gradient) {
@@ -292,6 +305,10 @@ CGImageRef CGImageCreateWithPNGDataProvider(
         LC32_CG_U32(shouldInterpolate), LC32_CG_U32(intent));
 }
 
+CGImageRef CGImageRetain(CGImageRef image) {
+    return image ? (CGImageRef)CFRetain(image) : NULL;
+}
+
 void CGImageRelease(CGImageRef image) {
     if(!image) return;
     CFRelease(image);
@@ -387,6 +404,10 @@ void CGContextDrawRadialGradient(CGContextRef context,
 void CGContextDrawPath(CGContextRef context, CGPathDrawingMode mode) {
     if(context) LC32_CG_CALL(LC32CoreGraphicsOpContextDrawPath,
         LC32_CG_HOST(context), LC32_CG_U32(mode));
+}
+
+CGContextRef CGContextRetain(CGContextRef context) {
+    return context ? (CGContextRef)CFRetain(context) : NULL;
 }
 
 void CGContextRelease(CGContextRef context) {
