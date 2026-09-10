@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cross-check a guest binary's imports against the guest framework shims.
+"""Cross-check a guest binary's imports and selectors against the shims.
 
 Reports, per framework, which imported symbols are definitely missing and
 which cannot be decided from the sources alone.  Macro-generated definitions
@@ -7,8 +7,15 @@ which cannot be decided from the sources alone.  Macro-generated definitions
 only exist after `generate-shims` runs cannot be matched textually, so those
 land in the undecidable bucket instead of being reported as missing.
 
+With --selectors it does the same for Objective-C: every selector in
+__objc_selrefs that the image does not implement itself is looked up in
+Generator/templates/generated.plist and in the hand-written shims.
+
 Usage:
   python tools/guest_symbol_gaps.py <guest binary> [--arch armv7]
+  python tools/guest_symbol_gaps.py <guest binary> --selectors
+
+Written with Claude Code.
 """
 
 import argparse
@@ -109,6 +116,49 @@ def macro_suffix_match(name, defined):
                 and len(entry[1]) < len(name):
             return entry[0]
     return None
+
+
+METHOD_DEFINITION = re.compile(
+    r"^([-+])\s*\(([^)]*)\)([^;{]*)\{", re.MULTILINE)
+SELECTOR_PART = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*:")
+BARE_SELECTOR = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*$")
+
+
+def selector_from_signature(signature):
+    """Rebuild a selector from the text between the return type and body."""
+    parts = SELECTOR_PART.findall(signature)
+    if parts:
+        return "".join(part + ":" for part in parts)
+    bare = BARE_SELECTOR.match(signature)
+    return bare.group(1) if bare else None
+
+
+def shim_selectors(directory):
+    """Selectors the hand-written shims implement, as (kind, selector)."""
+    found = set()
+    for text in read_sources(directory):
+        for kind, _return_type, signature in METHOD_DEFINITION.findall(text):
+            selector = selector_from_signature(signature)
+            if selector:
+                found.add((kind, selector))
+    return found
+
+
+def generated_selectors():
+    """Selectors generated.plist declares, mapped to Framework/Class owners."""
+    if not os.path.exists(SIGNATURES):
+        return {}
+    with open(SIGNATURES, "rb") as handle:
+        signatures = plistlib.load(handle)
+
+    owners = {}
+    for framework, classes in signatures.items():
+        for class_name, methods in classes.items():
+            for kind in ("+", "-"):
+                for selector in methods.get(kind, {}):
+                    owners.setdefault((kind, selector), []).append(
+                        "%s/%s" % (framework, class_name))
+    return owners
 
 
 def generated_classes():
@@ -258,13 +308,72 @@ def classify(binary, arch):
     return image, rows
 
 
+def classify_selectors(binary, arch):
+    with open(binary, "rb") as handle:
+        data = handle.read()
+    slices = macho_imports.list_slices(data)
+    chosen = macho_imports.select_slice(slices, arch)
+    if chosen is None:
+        raise SystemExit("no matching slice; available: %s" % ", ".join(
+            entry[2] for entry in slices))
+    metadata = macho_imports.objc_metadata(data, chosen[0], chosen[1])
+
+    owners = generated_selectors()
+    declared = {selector for _kind, selector in owners}
+
+    implemented = set()
+    for name in sorted(os.listdir(GUEST_ROOT)):
+        directory = os.path.join(GUEST_ROOT, name)
+        if os.path.isdir(directory) and not name.startswith("."):
+            implemented |= shim_selectors(directory)
+    if os.path.isdir(GENERATED_ROOT):
+        implemented |= shim_selectors(GENERATED_ROOT)
+    implemented_names = {selector for _kind, selector in implemented}
+
+    own = set(metadata["own_selectors"])
+    rows = []
+    for selector in metadata["selrefs"]:
+        if selector in own:
+            rows.append((selector, "own", "implemented by the app itself"))
+        elif selector in declared:
+            classes = sorted({owner for (_kind, name), values in owners.items()
+                if name == selector for owner in values})
+            rows.append((selector, "declared", ", ".join(classes[:4]) + (
+                " (+%d more)" % (len(classes) - 4) if len(classes) > 4 else "")))
+        elif selector in implemented_names:
+            rows.append((selector, "declared", "hand-written shim"))
+        else:
+            rows.append((selector, "missing", "not in generated.plist"))
+    return metadata, rows
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary")
     parser.add_argument("--arch")
+    parser.add_argument("--selectors", action="store_true",
+        help="check __objc_selrefs against generated.plist instead of the "
+             "imported C symbols")
     parser.add_argument("--show", choices=("missing", "undecidable", "all"),
         default="missing")
     args = parser.parse_args()
+
+    if args.selectors:
+        metadata, rows = classify_selectors(args.binary, args.arch)
+        counts = {}
+        for _selector, verdict, _why in rows:
+            counts[verdict] = counts.get(verdict, 0) + 1
+        print("# arch: %s" % metadata["arch"])
+        print("# selrefs: %d (%s)" % (len(rows), ", ".join(
+            "%s=%d" % item for item in sorted(counts.items()))))
+        print("# the image defines %d classes and %d categories of its own"
+            % (len(metadata["own_classes"]), len(metadata["own_categories"])))
+        print()
+        missing = [row for row in rows if row[1] == "missing"]
+        print("== selectors with no shim (%d) ==" % len(missing))
+        for selector, _verdict, _why in missing:
+            print("  %s" % selector)
+        return 0
 
     image, rows = classify(args.binary, args.arch)
 
