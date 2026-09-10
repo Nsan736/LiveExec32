@@ -7,6 +7,10 @@ Not all apps will work and will mostly run into missing symbols issue. Please op
 > This is a fork. See [FORK_NOTES.md](FORK_NOTES.md) for the shim and
 > generator fixes it adds, and for `tools/`, which audits a 32-bit app's
 > imports and selectors against the guest shims before you run it.
+>
+> Everything below is upstream's README, kept as-is. In particular, the note
+> that follows describes upstream's own work — the LLM it names is not the
+> one used in this fork.
 
 > [!NOTE]
 > Some further work in this branch is done by LLM, mainly GPT-5.6 Sol; notable for implementing GDB Stub, Native Threads, more shims, etc.
