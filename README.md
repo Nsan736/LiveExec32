@@ -4,6 +4,11 @@ Run 32-bit binaries on 64-bit iOS by passing through syscalls.
 Not all apps will work and will mostly run into missing symbols issue. Please open an issue for that.
 
 > [!NOTE]
+> This is a fork. See [FORK_NOTES.md](FORK_NOTES.md) for the shim and
+> generator fixes it adds, and for `tools/`, which audits a 32-bit app's
+> imports and selectors against the guest shims before you run it.
+
+> [!NOTE]
 > Some further work in this branch is done by LLM, mainly GPT-5.6 Sol; notable for implementing GDB Stub, Native Threads, more shims, etc.
 > Its commit history is kept for later reference.
 > Last commit before LLM is [dbd36e3](https://github.com/LiveContainer/LiveExec32/commit/dbd36e3e42e4e675e6fd542d4a487b61dbdc755d)
