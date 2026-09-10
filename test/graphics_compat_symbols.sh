@@ -28,6 +28,8 @@ audit_image() {
 }
 
 audit_image "$FRAMEWORK_DIR/CoreGraphics.framework/CoreGraphics" \
+    CGBitmapContextGetHeight \
+    CGBitmapContextGetWidth \
     CGColorRetain \
     CGColorSpaceRetain \
     CGContextAddLines \

@@ -970,6 +970,21 @@ u32 LC32_CoreGraphics_Dispatch(u32 opcode, u32 guestCall, u32) {
             CGImageRef image = CGBitmapContextCreateImage(context);
             return image ? LC32GuestObjectForOwnedHostObject(image) : 0;
         }
+        case LC32CoreGraphicsOpBitmapContextGetWidth: {
+            if(!RequireCoreGraphicsSlots(call, 1)) return 0;
+            CGContextRef context = SlotHostObject<CGContextRef>(call, 0);
+            /* Unlike the row stride, the pixel dimensions are handed to the
+             * host context unchanged by BitmapContextCreate, so the native
+             * answer is already the one the guest asked for. */
+            return context
+                ? static_cast<u32>(CGBitmapContextGetWidth(context)) : 0;
+        }
+        case LC32CoreGraphicsOpBitmapContextGetHeight: {
+            if(!RequireCoreGraphicsSlots(call, 1)) return 0;
+            CGContextRef context = SlotHostObject<CGContextRef>(call, 0);
+            return context
+                ? static_cast<u32>(CGBitmapContextGetHeight(context)) : 0;
+        }
         case LC32CoreGraphicsOpBitmapContextGetBytesPerRow: {
             if(!RequireCoreGraphicsSlots(call, 1)) return 0;
             CGContextRef context = SlotHostObject<CGContextRef>(call, 0);

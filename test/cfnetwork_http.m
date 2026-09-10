@@ -150,6 +150,19 @@ int main(void) {
         CFHostRef hostCopy = CFHostCreateCopy(kCFAllocatorDefault, host);
         if(!result) result = Check(hostCopy != NULL, 31);
         if(hostCopy) CFRelease(hostCopy);
+
+        /* The socket pair is a stub: both streams must come back NULL so
+         * callers take their connection-failed path instead of using an
+         * uninitialized reference. */
+        CFReadStreamRef hostReadStream = (CFReadStreamRef)(uintptr_t)1;
+        CFWriteStreamRef hostWriteStream = (CFWriteStreamRef)(uintptr_t)1;
+        CFStreamCreatePairWithSocketToCFHost(kCFAllocatorDefault, host, 80,
+            &hostReadStream, &hostWriteStream);
+        if(!result) result = Check(hostReadStream == NULL &&
+            hostWriteStream == NULL, 47);
+        if(hostReadStream) CFRelease(hostReadStream);
+        if(hostWriteStream) CFRelease(hostWriteStream);
+
         CFRelease(host);
     }
 

@@ -335,6 +335,18 @@ CGImageRef CGBitmapContextCreateImage(CGContextRef context) {
         LC32_CG_HOST(context)) : NULL;
 }
 
+size_t CGBitmapContextGetWidth(CGContextRef context) {
+    return context ? (size_t)LC32_CG_CALL(
+        LC32CoreGraphicsOpBitmapContextGetWidth,
+        LC32_CG_HOST(context)) : 0;
+}
+
+size_t CGBitmapContextGetHeight(CGContextRef context) {
+    return context ? (size_t)LC32_CG_CALL(
+        LC32CoreGraphicsOpBitmapContextGetHeight,
+        LC32_CG_HOST(context)) : 0;
+}
+
 size_t CGBitmapContextGetBytesPerRow(CGContextRef context) {
     return context ? (size_t)LC32_CG_CALL(
         LC32CoreGraphicsOpBitmapContextGetBytesPerRow,

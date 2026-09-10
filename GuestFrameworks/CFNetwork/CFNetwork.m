@@ -430,6 +430,25 @@ CFDataRef CFHostGetReachability(CFHostRef host,
         LC32_CFNETWORK_U32((uintptr_t)hasBeenResolved)) : NULL;
 }
 
+/*
+ * CFHost resolution is not forwarded, so a socket pair cannot be opened for
+ * a host reference.  CoreFoundation reports that failure by leaving both out
+ * parameters NULL, which is what CFStreamCreatePairWithSocketToHost already
+ * does when it rejects its arguments.  Callers that check the streams take
+ * their normal connection-failed path; the CFStream shims tolerate NULL, so
+ * callers that do not check are no worse off than with a failed connection.
+ */
+void CFStreamCreatePairWithSocketToCFHost(CFAllocatorRef allocator,
+                                          CFHostRef host, SInt32 port,
+                                          CFReadStreamRef *readStream,
+                                          CFWriteStreamRef *writeStream) {
+    (void)allocator;
+    (void)host;
+    (void)port;
+    if(readStream) *readStream = NULL;
+    if(writeStream) *writeStream = NULL;
+}
+
 CFTypeID CFNetServiceGetTypeID(void) {
     return (CFTypeID)LC32_CFNETWORK_CALL0(
         LC32CFNetworkOpNetServiceGetTypeID);
