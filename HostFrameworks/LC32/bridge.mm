@@ -2,6 +2,7 @@
 #include "crash_exception.h"
 #include "LC32ObjCBridgeABI.h"
 #include "LC32DebugLog.h"
+#include "guest_frame_trace.h"
 
 #import <dispatch/dispatch.h>
 #import <mach/mach_init.h>
@@ -11,9 +12,11 @@
 
 #include <cmath>
 
+#include <algorithm>
 #include <atomic>
 #include <array>
 #include <cerrno>
+#include <dlfcn.h>
 #include <cstddef>
 #include <cstdlib>
 #include <memory>
@@ -4805,8 +4808,50 @@ struct GuestFrameSample {
     // they stay valid after the receiver is gone and on the writer thread.
     const char *className;
     const char *selectorName;
+    unsigned bridgeCalls;
+    unsigned runningSvcs;
     char kind;
 };
+
+/*
+ * Which host calls a frame made, keyed by SEL or function pointer. Open
+ * addressed with a short probe so a hit costs a hash and a compare or two;
+ * an unordered_map lookup would be the same order as the bridge call it is
+ * trying to account for.
+ *
+ * A key that finds no free slot within the probe window is dropped and
+ * counted in overflowed, which is reported so the table size can be judged
+ * rather than guessed.
+ */
+constexpr size_t kGuestHostCallSlots = 256;
+constexpr size_t kGuestHostCallProbeLimit = 16;
+
+struct GuestHostCallSlot {
+    const void *key;
+    uint64_t count;
+    int kind;
+};
+
+struct GuestHostCallTable {
+    GuestHostCallSlot slots[kGuestHostCallSlots];
+    // Calls whose key found no free slot within the probe window. Reported
+    // so the table size can be judged from real traffic.
+    uint64_t dropped;
+};
+
+thread_local GuestHostCallTable guestHostCalls = {};
+
+// One handoff to the writer thread: the frames plus the host calls they made.
+struct GuestFrameBatch {
+    std::vector<GuestFrameSample> samples;
+    GuestHostCallTable hostCalls;
+};
+
+size_t GuestHostCallSlotFor(const void *key) {
+    uint64_t hash = reinterpret_cast<uintptr_t>(key) >> 4;
+    hash *= 0x9E3779B97F4A7C15ull;
+    return static_cast<size_t>(hash >> 56) % kGuestHostCallSlots;
+}
 
 /*
  * The trace lands next to LiveExec32.log in the container's Documents
@@ -4841,7 +4886,8 @@ FILE *GuestFrameTraceFile() {
         setvbuf(handle, buffer, _IOFBF, sizeof(buffer));
         fprintf(handle,
             "# LiveExec32 guest frame trace\n"
-            "# milliseconds\tvsync periods at 60 Hz\tcallback\n");
+            "# milliseconds\tvsync periods at 60 Hz\tbridge calls"
+            "\tinline syscalls\tcallback\n");
         // A crash still loses at most one unflushed batch; this only covers
         // an orderly exit.
         atexit([] {
@@ -4858,8 +4904,59 @@ dispatch_queue_t GuestFrameTraceQueue() {
     return queue;
 }
 
+// Name resolution happens here rather than on the guest thread: dladdr is
+// far too expensive to call per bridge call, and the answers never change.
+const char *GuestHostCallName(const void *key, int kind) {
+    static std::unordered_map<const void *, std::string> names;
+    const auto known = names.find(key);
+    if(known != names.end()) return known->second.c_str();
+
+    std::string name;
+    if(kind == LC32GuestHostCallSelector) {
+        const char *selector = sel_getName(const_cast<SEL>(
+            static_cast<const struct objc_selector *>(key)));
+        name = selector ? selector : "(selector)";
+    } else {
+        Dl_info info = {};
+        if(dladdr(key, &info) && info.dli_sname) {
+            name = info.dli_sname;
+        } else {
+            char buffer[32];
+            snprintf(buffer, sizeof(buffer), "%p", key);
+            name = buffer;
+        }
+    }
+    return names.emplace(key, std::move(name)).first->second.c_str();
+}
+
+void WriteGuestHostCalls(FILE *file, const GuestHostCallTable &table) {
+    std::vector<const GuestHostCallSlot *> used;
+    for(const GuestHostCallSlot &slot : table.slots) {
+        if(slot.key) used.push_back(&slot);
+    }
+    std::sort(used.begin(), used.end(),
+        [](const GuestHostCallSlot *left, const GuestHostCallSlot *right) {
+            return left->count > right->count;
+        });
+
+    fprintf(file, "# host calls: %zu distinct of %zu slots",
+        used.size(), kGuestHostCallSlots);
+    if(table.dropped) {
+        fprintf(file, ", %llu calls dropped -- the table is too small",
+            static_cast<unsigned long long>(table.dropped));
+    }
+    fprintf(file, "\n");
+
+    const size_t reported = used.size() < 20 ? used.size() : 20;
+    for(size_t index = 0; index < reported; index++) {
+        fprintf(file, "#   %llu\t%s\n",
+            static_cast<unsigned long long>(used[index]->count),
+            GuestHostCallName(used[index]->key, used[index]->kind));
+    }
+}
+
 // Formatting and I/O run here, off the guest thread.
-void WriteGuestFrameSamples(const std::vector<GuestFrameSample> &samples) {
+void WriteGuestFrameBatch(const GuestFrameBatch &batch) {
     FILE *file = GuestFrameTraceFile();
     if(!file) return;
 
@@ -4868,10 +4965,15 @@ void WriteGuestFrameSamples(const std::vector<GuestFrameSample> &samples) {
     static double summaryTotal = 0;
     static double summaryWorst = 0;
 
-    for(const GuestFrameSample &sample : samples) {
-        fprintf(file, "%.2f\t%d\t%c[%s %s]\n", sample.milliseconds,
+    for(const GuestFrameSample &sample : batch.samples) {
+        // A bridge call enters the SVC handler once to halt the JIT and once
+        // to be serviced, so the inline syscalls are what is left over.
+        const unsigned inlineSvcs = sample.runningSvcs > sample.bridgeCalls
+            ? sample.runningSvcs - sample.bridgeCalls : 0;
+        fprintf(file, "%.2f\t%d\t%u\t%u\t%c[%s %s]\n", sample.milliseconds,
             static_cast<int>(std::ceil(
                 sample.milliseconds / kGuestFrameBudgetMilliseconds)),
+            sample.bridgeCalls, inlineSvcs,
             sample.kind, sample.className, sample.selectorName);
 
         summaryCount++;
@@ -4893,12 +4995,15 @@ void WriteGuestFrameSamples(const std::vector<GuestFrameSample> &samples) {
             summaryWorst = 0;
         }
     }
+    WriteGuestHostCalls(file, batch.hostCalls);
     fflush(file);
 }
 
 struct GuestFrameTraceState {
     unsigned depth;
     u64 start;
+    unsigned bridgeCalls;
+    unsigned runningSvcs;
     std::vector<GuestFrameSample> samples;
 };
 
@@ -4906,12 +5011,14 @@ thread_local GuestFrameTraceState guestFrameTrace = {};
 
 void FlushGuestFrameSamples(GuestFrameTraceState &state) {
     if(state.samples.empty()) return;
-    auto batch = std::make_shared<std::vector<GuestFrameSample>>(
-        std::move(state.samples));
+    auto batch = std::make_shared<GuestFrameBatch>();
+    batch->samples = std::move(state.samples);
+    batch->hostCalls = guestHostCalls;
     state.samples.clear();
     state.samples.reserve(kGuestFrameFlushInterval);
+    guestHostCalls = {};
     dispatch_async(GuestFrameTraceQueue(), ^{
-        WriteGuestFrameSamples(*batch);
+        WriteGuestFrameBatch(*batch);
     });
 }
 
@@ -4935,6 +5042,8 @@ struct GuestFrameTraceScope {
         selectorName = selector ? sel_getName(selector) : "(null)";
         if(guestFrameTrace.depth++ == 0) {
             guestFrameTrace.start = mach_absolute_time();
+            guestFrameTrace.bridgeCalls = 0;
+            guestFrameTrace.runningSvcs = 0;
         }
     }
 
@@ -4949,8 +5058,8 @@ struct GuestFrameTraceScope {
         const double milliseconds = GuestFrameMilliseconds(
             mach_absolute_time() - guestFrameTrace.start);
         GuestFrameTraceState &state = guestFrameTrace;
-        state.samples.push_back(
-            {milliseconds, className, selectorName, kind});
+        state.samples.push_back({milliseconds, className, selectorName,
+            state.bridgeCalls, state.runningSvcs, kind});
         if(state.samples.size() >= kGuestFrameFlushInterval) {
             FlushGuestFrameSamples(state);
         }
@@ -4958,6 +5067,34 @@ struct GuestFrameTraceScope {
 };
 
 }  // namespace
+
+void LC32GuestFrameTraceCountBridgeCall(void) {
+    guestFrameTrace.bridgeCalls++;
+}
+
+void LC32GuestFrameTraceCountRunningSvc(void) {
+    guestFrameTrace.runningSvcs++;
+}
+
+void LC32GuestFrameTraceCountHostCall(const void *key, int kind) {
+    if(!key) return;
+    size_t slot = GuestHostCallSlotFor(key);
+    for(size_t probe = 0; probe < kGuestHostCallProbeLimit; probe++) {
+        GuestHostCallSlot &entry = guestHostCalls.slots[slot];
+        if(entry.key == key) {
+            entry.count++;
+            return;
+        }
+        if(!entry.key) {
+            entry.key = key;
+            entry.kind = kind;
+            entry.count = 1;
+            return;
+        }
+        slot = (slot + 1) % kGuestHostCallSlots;
+    }
+    guestHostCalls.dropped++;
+}
 
 #define LC32_TRACE_GUEST_FRAME(receiver, selector) \
     GuestFrameTraceScope lc32GuestFrameTraceScope((receiver), (selector))

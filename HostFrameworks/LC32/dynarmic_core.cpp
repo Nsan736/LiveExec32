@@ -1,5 +1,7 @@
 #include "dynarmic_internal.h"
 #include "darwin_file_syscalls.h"
+// Included before the extern "C" block: these hooks have C++ linkage.
+#include "guest_frame_trace.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -37,6 +39,8 @@ static Dynarmic::HaltReason StepGuestJit(
 }
 
 static void ServiceGuestSVC() {
+    // One guest -> host bridge call: the JIT is already stopped here.
+    LC32_FRAME_TRACE_BRIDGE_CALL();
     GuestVmEpochGuard guard(
         CurrentGuestVmEpochParticipant());
     DynarmicCallbacks32UserCallbacks(

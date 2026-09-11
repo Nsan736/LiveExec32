@@ -1,5 +1,6 @@
 #include "dynarmic_internal.h"
 #include "dynarmic_syscalls.h"
+#include "guest_frame_trace.h"
 #include "darwin_file_syscalls.h"
 #include "crash_exception.h"
 
@@ -873,6 +874,9 @@ public:
     }
 
     void CallSVC(u32 swi) override {
+        // Counted while the JIT is running, which is every inline syscall
+        // plus the one entry each bridge call makes before halting.
+        if (cpu->IsExecuting()) LC32_FRAME_TRACE_RUNNING_SVC();
         int NR = cpu->Regs()[12];
         if (swi == 0 && cpu->Regs()[5] == POST_CALLBACK_SYSCALL_NUMBER && cpu->Regs()[7] == 0) { // postCallback
             int number = cpu->Regs()[4];
@@ -2159,6 +2163,8 @@ BE CAREFUL WHEN MOVING SYSCALL. Checklist:
                 }
                 typedef u32(*HostCall)(u32, u32, u32);
                 HostCall hostCall = (HostCall)((u64)cpu->Regs()[0] | ((u64)cpu->Regs()[1] << 32));
+                LC32_FRAME_TRACE_HOST_CALL(
+                    (const void *)hostCall, LC32GuestHostCallFunction);
                 const u32 result = InvokeNativeGuestHostCall([&] {
                     return hostCall(cpu->Regs()[2], cpu->Regs()[3],
                         cpu->Regs()[Reg::SP]);
@@ -2195,6 +2201,9 @@ BE CAREFUL WHEN MOVING SYSCALL. Checklist:
                 }
                 u64 host_self = (u64)cpu->Regs()[0] | ((u64)cpu->Regs()[1] << 32);
                 u64 host_cmd = (u64)cpu->Regs()[2] | ((u64)cpu->Regs()[3] << 32);
+                LC32_FRAME_TRACE_HOST_CALL(
+                    (const void *)(uintptr_t)host_cmd,
+                    LC32GuestHostCallSelector);
                 u64 result = InvokeNativeGuestHostCall([&] {
                     return LC32InvokeHostSelector(
                         host_self, host_cmd, cpu->Regs()[Reg::SP]);
