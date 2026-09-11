@@ -4913,8 +4913,9 @@ const char *GuestHostCallName(const void *key, int kind) {
 
     std::string name;
     if(kind == LC32GuestHostCallSelector) {
-        const char *selector = sel_getName(const_cast<SEL>(
-            static_cast<const struct objc_selector *>(key)));
+        // SEL is not a plain pointer to a const-qualifiable type, so a
+        // const_cast does not apply; drop the qualifier the C way.
+        const char *selector = sel_getName((SEL)key);
         name = selector ? selector : "(selector)";
     } else {
         Dl_info info = {};
